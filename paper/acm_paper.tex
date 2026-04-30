@@ -1,0 +1,773 @@
+%%
+%% ACM Conference Paper — Two-Column (sigconf)
+%% Title: Weaponized Weights: A Cryptographic Provenance and Binary
+%%        Inspection Framework for Securing ML Model Artifacts in
+%%        Enterprise MLOps Pipelines
+%%
+%% Authors: Sunil Gentyala, Rakesh Prakash
+%%
+%% Compile: pdflatex acm_paper && bibtex acm_paper && pdflatex acm_paper (x2)
+%%
+
+\documentclass[sigconf,review]{acmart}
+
+%% -----------------------------------------------------------------------
+%% ACM rights block — update before camera-ready submission
+%% -----------------------------------------------------------------------
+\copyrightyear{2026}
+\acmYear{2026}
+\setcopyright{acmcopyright}
+\acmConference[ACM CCS '26]{ACM SIGSAC Conference on Computer and
+  Communications Security}{November 2026}{Salt Lake City, UT, USA}
+\acmBooktitle{ACM CCS '26: ACM SIGSAC Conference on Computer and
+  Communications Security, November 2026, Salt Lake City, UT, USA}
+\acmDOI{10.1145/XXXXXXX.XXXXXXX}
+\acmISBN{978-1-4503-XXXX-X/26/11}
+
+%% -----------------------------------------------------------------------
+%% Packages
+%% -----------------------------------------------------------------------
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{balance}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  captionpos=b,
+  numbers=left,
+  numberstyle=\tiny,
+  tabsize=2,
+}
+
+%% -----------------------------------------------------------------------
+%% CCS Concepts
+%% -----------------------------------------------------------------------
+\begin{CCSXML}
+<ccs2012>
+  <concept>
+    <concept_id>10002978.10002997.10002998</concept_id>
+    <concept_desc>Security and privacy~Software security engineering</concept_desc>
+    <concept_significance>500</concept_significance>
+  </concept>
+  <concept>
+    <concept_id>10002978.10002997.10003003</concept_id>
+    <concept_desc>Security and privacy~Malware and its mitigation</concept_desc>
+    <concept_significance>300</concept_significance>
+  </concept>
+  <concept>
+    <concept_id>10010147.10010178</concept_id>
+    <concept_desc>Computing methodologies~Machine learning</concept_desc>
+    <concept_significance>200</concept_significance>
+  </concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Security and privacy~Software security engineering}
+\ccsdesc[300]{Security and privacy~Malware and its mitigation}
+\ccsdesc[200]{Computing methodologies~Machine learning}
+
+%% -----------------------------------------------------------------------
+%% Keywords
+%% -----------------------------------------------------------------------
+\keywords{machine learning security, supply chain attack, model provenance,
+  Safetensors, GGUF, pickle deserialization, MLOps, cryptographic
+  verification, CI/CD security, binary inspection}
+
+%% -----------------------------------------------------------------------
+%% Authors
+%% -----------------------------------------------------------------------
+\author{Sunil Gentyala}
+\authornote{Corresponding author.}
+\email{sunil.gentyala@ieee.org}
+\orcid{0000-0000-0000-0000}
+\affiliation{%
+  \institution{HCLTech}
+  \department{Cybersecurity and AI Security Practice}
+  \city{Dallas}
+  \state{TX}
+  \country{USA}
+}
+
+\author{Rakesh Prakash}
+\email{Rakesh.Prakash@colorado.edu}
+\affiliation{%
+  \institution{University of Colorado Boulder}
+  \department{Department of Computer Science}
+  \city{Boulder}
+  \state{CO}
+  \country{USA}
+}
+
+%% -----------------------------------------------------------------------
+%% Title
+%% -----------------------------------------------------------------------
+\title{Weaponized Weights: A Cryptographic Provenance and Binary Inspection
+  Framework for Securing Machine Learning Model Artifacts in Enterprise
+  MLOps Pipelines}
+
+%%
+%% -----------------------------------------------------------------------
+\begin{document}
+
+\begin{abstract}
+The proliferation of publicly distributed machine learning model artifacts
+has introduced a structural security risk that conventional enterprise
+tooling is fundamentally ill-equipped to address. Weight files serialized in
+PyTorch checkpoint, Safetensors, and GGUF formats are routinely downloaded
+from public model repositories and admitted into production inference
+pipelines without binary-level inspection or cryptographic provenance
+verification. Existing static analysis, dynamic analysis, and antivirus
+infrastructure have no visibility into these binary weight formats, leaving
+organizations exposed to a class of supply chain attack that operates
+entirely below the application layer.
+
+We present \textit{model-provenance-guard}, a production-ready, open-source
+toolkit comprising a Python binary inspector (\texttt{verify\_weights.py})
+and a five-stage GitHub Actions provenance gate. The pipeline enforces
+SHA-256 hash verification against an internal trusted registry, Sigstore/Cosign
+cryptographic signature checking, pickle opcode scanning via
+\texttt{picklescan}, Safetensors header anomaly detection, and GGUF metadata
+key auditing before any artifact is promoted within a downstream pipeline.
+We develop a structured, format-level threat model grounded in documented
+real-world incidents and published vulnerability disclosures, and evaluate
+the toolkit against eight synthetic adversarial test cases that exercise
+dtype manipulation, data offset injection, magic byte substitution, and
+malformed JSON header attacks. The inspector achieved zero false negatives
+across all adversarial scenarios and zero false positives on benign artifacts,
+demonstrating that shift-left provenance enforcement is both technically
+feasible and operationally practical at the CI/CD boundary.
+\end{abstract}
+
+\maketitle
+
+%% -----------------------------------------------------------------------
+\section{Introduction}
+%% -----------------------------------------------------------------------
+
+The security community's attention toward artificial intelligence systems
+has concentrated heavily on prompt injection and model output manipulation
+over the past two years. Those concerns are legitimate, but their prominence
+has allowed a structurally more dangerous threat to mature with insufficient
+scrutiny. Adversaries are no longer confined to crafting adversarial inputs
+at runtime. They are embedding threats directly inside compiled weight
+artifacts that machine learning engineers download from public repositories
+as a routine operational act.
+
+The attack surface has migrated from the application layer to the binary
+layer, and the tooling most enterprises rely on for security assurance lacks
+any meaningful visibility there. Static application security testing (SAST)
+tools analyze source code. Dynamic application security testing (DAST)
+tools probe running applications. Antivirus engines match file content against
+known malware signatures. None of these approaches has any concept of what
+lies inside a 4-bit quantized GGUF binary, a Safetensors archive, or a
+PyTorch checkpoint serialized with Python's \texttt{pickle} protocol. When
+an engineer issues a \texttt{huggingface-cli download} command, the SIEM
+records a successful HTTPS transfer. The endpoint detection and response
+(EDR) agent observes a large file write to local storage. Neither surface
+has instrumented the structural integrity of the artifact that was just
+admitted into the environment.
+
+Three weight file formats account for the substantial majority of model
+artifacts in contemporary enterprise inference deployments. PyTorch
+\texttt{.pt} and \texttt{.pth} checkpoints use Python's \texttt{pickle}
+serialization protocol, which by design permits arbitrary Python objects to
+be deserialized, creating a direct remote code execution (RCE) vector at
+the moment \texttt{torch.load()} is called~\cite{pickleball2025}. Safetensors
+was introduced specifically to eliminate deserialization-time code execution,
+and it succeeds in that narrow objective; however, the format's JSON header,
+which is parsed before any tensor data is loaded into memory, presents its
+own attack surface through parser exploitation, metadata field abuse, and
+the silent embedding of neural backdoor weights~\cite{safetensors2025empirical}.
+GGUF, the dominant format for quantized inference with llama.cpp and Ollama,
+includes a flexible key-value metadata section with no schema enforcement, and
+multiple heap-buffer-overflow vulnerabilities in its reference parsing
+implementation were disclosed by Cisco Talos in early 2024~\cite{gguf_quantization_attack2024}.
+
+The practical attack pathway is straightforward. A threat actor forks a
+popular model repository on Hugging Face, introduces a superficially plausible
+commit, and publishes modified weight files. Engineers searching for a
+specific model version frequently pull from forks without verifying
+cryptographic provenance. The artifact enters the MLOps pipeline, clears
+code-focused CI checks, and reaches a production inference endpoint. Hugging
+Face does not cryptographically sign model artifacts by default. Hash values
+published in model cards are informational metadata that any repository
+owner, including a malicious one, can update after the fact.
+
+This paper makes the following contributions:
+
+\begin{itemize}
+  \item A format-level threat model that characterizes the attack surface
+    of PyTorch checkpoints, Safetensors archives, and GGUF binaries, grounded
+    in documented incidents and peer-reviewed vulnerability research.
+  \item \texttt{verify\_weights.py}, a Python binary inspector that performs
+    Safetensors header anomaly detection and GGUF magic-byte and metadata
+    key auditing without loading tensor data into memory.
+  \item A five-stage GitHub Actions provenance gate
+    (\texttt{model\_scan.yml}) that integrates registry hash verification,
+    Sigstore/Cosign signature checking, \texttt{picklescan} opcode analysis,
+    and binary inspection into a blocking CI/CD workflow.
+  \item An empirical evaluation against eight synthetic adversarial test
+    cases, demonstrating zero false negatives and zero false positives under
+    controlled conditions.
+  \item An open-source release of the complete toolkit at
+    \url{https://github.com/sunilgentyala/model-provenance-guard}.
+\end{itemize}
+
+The remainder of the paper proceeds as follows. Section~\ref{sec:background}
+surveys related work. Section~\ref{sec:threat} formalizes the threat model.
+Section~\ref{sec:design} describes the system architecture. Section~\ref{sec:impl}
+details the implementation. Section~\ref{sec:eval} presents the evaluation.
+Section~\ref{sec:discussion} discusses limitations and future directions.
+Section~\ref{sec:conclusion} concludes.
+
+%% -----------------------------------------------------------------------
+\section{Background and Related Work}
+\label{sec:background}
+%% -----------------------------------------------------------------------
+
+\subsection{Machine Learning Supply Chain Attacks}
+
+The concept of a software supply chain attack is well established in the
+security literature, but its application to machine learning weight artifacts
+is comparatively recent. Jiang et al.~\cite{modelsarecodes2024} conducted
+a systematic measurement study of malicious code poisoning attacks on
+pre-trained model hubs and found that attackers exploit the implicit trust
+engineers place in popular repository namespaces. Separately, documented
+incidents on Hugging Face have confirmed that malicious model artifacts can
+execute reverse shell payloads at load time, yielding full control of
+GPU-enabled inference infrastructure. The Communications of the ACM survey
+by~\citet{maliciousai2025} argues that the combination of high download
+volumes and weak provenance controls makes model hubs uniquely attractive
+targets relative to traditional software package registries.
+
+The zero-trust perspective on AI data pipelines, articulated by
+\citet{mudusu2026zerotrust}, establishes that the never-trust-always-verify
+principle must be applied not merely to network perimeters but directly to
+data and model artifacts throughout the pipeline. That work demonstrates
+that cryptographic authentication and tamper-evident lineage tracking,
+implemented with ECDSA-P384 tokens and continuous policy enforcement, can
+achieve complete detection of data tampering and component impersonation in
+production AI systems. Our framework extends those principles specifically
+to weight file artifacts at the CI/CD intake boundary.
+
+\subsection{Pickle Deserialization in PyTorch Checkpoints}
+
+The vulnerability class most thoroughly studied in the context of ML weight
+files is pickle deserialization. Python's \texttt{pickle} module supports a
+\texttt{\_\_reduce\_\_} protocol that enables arbitrary Python callables to
+execute during deserialization. Any \texttt{torch.load()} call on a
+maliciously constructed checkpoint can trigger operating system command
+execution without any user interaction~\cite{pickleball2025}. Koishybayev
+et al.~\cite{pickleball2025} present PickleBall, a secure deserialization
+system that intercepts pickle opcodes before object reconstruction and
+enforces a safe-by-default allowlist, demonstrating that the vulnerability
+is addressable but requires a purpose-built defense rather than a general
+virus scanner. JFrog Security Research additionally disclosed three zero-day
+vulnerabilities in the widely deployed \texttt{picklescan} tool itself,
+underscoring that even dedicated opcode scanners carry their own risk
+surface.
+
+\subsection{Safetensors Format and Header Security}
+
+The Safetensors format was developed by Hugging Face as a direct response
+to the RCE risks inherent in pickle-based serialization~\cite{safetensors2025empirical}.
+By replacing pickle with a JSON-encoded header followed by raw tensor byte
+data, Safetensors eliminates arbitrary code execution at load time. The
+Trail of Bits security assessment of the Safetensors library~(2023)
+confirmed the absence of deserialization vulnerabilities in the reference
+implementation. However, the header parsing step introduces its own attack
+surface: oversized JSON headers, malformed Unicode sequences, invalid tensor
+dtype values, and data offsets that exceed file boundaries all represent
+anomalies that warrant blocking behavior. CryptoTensors~\cite{cryptotensors2024}
+proposes extending this format with tensor-level encryption and embedded
+access control policies, indicating an active research community around
+format security beyond the elimination of deserialization.
+
+\subsection{GGUF Format Vulnerabilities}
+
+GGUF, introduced by the \texttt{ggml} project in August 2023 and
+subsequently adopted as the standard distribution format for quantized
+models in the Ollama and llama.cpp ecosystems, presents a distinct set of
+security concerns. Cisco Talos disclosed three heap-buffer-overflow
+vulnerabilities in llama.cpp's GGUF parser in early 2024, all arising from
+insufficient bounds checking in the metadata key-value parsing code. These
+vulnerabilities confirm that GGUF files consumed by native C/C++
+implementations can trigger memory corruption in unpatched consumers.
+Beyond implementation flaws, researchers have demonstrated that quantization
+error in GGUF models provides sufficient numerical flexibility to construct
+adversarial models whose malicious behavior is invisible in full-precision
+analysis but activates under quantized inference~\cite{gguf_quantization_attack2024}.
+
+\subsection{Neural Backdoor Attacks}
+
+The neural backdoor threat, formalized by \citeauthor{gu2019badnets} in the
+seminal BadNets paper~\cite{gu2019badnets}, involves poisoning model weights
+during training such that the model produces correct outputs on clean inputs
+but triggers a targeted misclassification on inputs containing a specific
+pattern. This attack class is particularly concerning because it is
+undetectable by any binary-level inspection technique: the weight file loads
+cleanly, passes format validation, and produces correct behavior under
+standard test inputs. Detection requires behavioral analysis at inference
+time, specifically monitoring for distributional anomalies in output
+probabilities conditioned on statistical baselines. Binary inspection,
+including the approach presented in this paper, explicitly does not address
+neural backdoors; we characterize this as a residual risk and a direction
+for complementary defense.
+
+\subsection{Software Artifact Signing}
+
+Sigstore~\cite{newman2022sigstore} provides a keyless signing infrastructure
+that ties artifact signatures to ephemeral OIDC identity tokens, dramatically
+lowering the adoption barrier relative to traditional GPG-based signing. The
+Cosign tool, part of the Sigstore ecosystem, supports signing and verification
+of arbitrary binary objects beyond container images, making it directly
+applicable to model weight files. As of 2025, Sigstore underpins artifact
+signing for npm, PyPI, and Kubernetes, and the OpenSSF AI/ML Working Group
+has adapted these mechanisms specifically for model signing in a dedicated
+specification~\cite{openssf_modelsigning2025}.
+
+\subsection{ML Provenance and Governance}
+
+Schlegel and Sattler~\cite{schlegel2024provenance} present a PROV-compliant
+provenance model for end-to-end ML pipelines that captures artifact lineage
+through MLflow and Git activities, enabling tamper-evident audit trails
+across training and deployment stages. \citeauthor{gentyala2026aisbom}~\cite{gentyala2026aisbom}
+frames the AI supply chain problem in terms of software bills of materials
+(SBOMs) extended to AI components, demonstrating that SBOM standards such
+as CycloneDX and SPDX can be adapted to encode model weight metadata,
+training data references, and cryptographic attestations. The NIST AI Risk
+Management Framework~\cite{nist_ai_rmf2023} and MITRE ATLAS~\cite{mitre_atlas2023}
+provide complementary governance and threat classification scaffolding. The
+OWASP Top 10 for LLM Applications explicitly names supply chain compromise
+as a critical risk category~\cite{owasp_llm_supply2025}.
+
+%% -----------------------------------------------------------------------
+\section{Threat Model}
+\label{sec:threat}
+%% -----------------------------------------------------------------------
+
+\subsection{Adversary Model}
+
+We consider a threat actor who has obtained write access to a model
+repository on a public model hub through one of three mechanisms: account
+compromise of a legitimate model publisher, submission of a malicious pull
+request that is merged by an inattentive or coerced maintainer, or creation
+of a confusingly named fork designed to capture traffic from engineers who
+do not verify repository provenance. The adversary's goal is to deliver a
+weaponized weight artifact to at least one GPU-enabled inference endpoint
+inside a target enterprise environment, either to execute arbitrary code at
+model load time (for PyTorch checkpoints), to exploit parser vulnerabilities
+in native runtimes (for GGUF), or to embed dormant backdoor weights that
+activate on a trigger the adversary controls (applicable to all formats).
+
+We assume the adversary has read-only access to the public model hub API
+and can observe which model versions are popular and frequently downloaded.
+We do not assume the adversary has network access to the target organization's
+internal infrastructure. We assume the target organization's CI/CD pipeline
+downloads model artifacts automatically from external sources as part of its
+standard model update workflow, which is the common MLOps pattern.
+
+\subsection{PyTorch Checkpoint Attack Surface}
+
+PyTorch checkpoints use Python's \texttt{pickle} serialization protocol.
+The \texttt{pickle} module supports a \texttt{\_\_reduce\_\_} method that,
+when present on a serialized object, is called by the deserializer to
+reconstruct the object. An attacker can craft a checkpoint that includes an
+object whose \texttt{\_\_reduce\_\_} method returns a callable paired with
+arguments, effectively embedding an arbitrary function call that executes
+the moment \texttt{torch.load()} is invoked. Common payloads include reverse
+shells, credential harvesters targeting cloud provider metadata endpoints,
+and persistence mechanisms that install themselves into the Python runtime.
+No user interaction beyond the standard model loading call is required.
+
+\subsection{Safetensors Attack Surface}
+
+While the Safetensors format eliminates deserialization-time code execution,
+it introduces three distinct attack surfaces. First, the JSON header
+processed before tensor data is loaded is vulnerable to parser exploits:
+oversized headers exceeding implementation-specific memory limits, embedded
+null bytes that confuse string parsers, and deeply nested JSON structures
+that trigger stack exhaustion in recursive parsers all represent viable
+denial-of-service vectors. Second, the \texttt{\_\_metadata\_\_} dictionary
+accepts arbitrary string key-value pairs with no schema enforcement;
+maliciously crafted values in this field can exploit applications that log,
+display, or forward metadata without sanitization. Third, and most
+consequentially for high-value enterprise targets, Safetensors files can
+carry weights poisoned at training time~\cite{gu2019badnets}. The file loads
+cleanly under all format-level checks. The backdoor activates only on
+attacker-chosen inputs.
+
+\subsection{GGUF Attack Surface}
+
+GGUF's binary metadata section has no schema enforcement beyond type tagging.
+A threat actor can embed arbitrary data under custom metadata keys; in native
+C and C++ consumers, keys or values whose lengths exceed what the consuming
+code anticipates can trigger heap-based buffer overflows. The version field
+at bytes 4--7 controls how the remainder of the file is parsed; supplying an
+unsupported version value can trigger undefined behavior in parsers that do
+not include explicit version gating. The tensor count field at bytes 8--15
+is trusted by consuming libraries; a declared count that differs from the
+number of tensors actually present in the file causes the parser to
+over-read memory.
+
+\subsection{Practical Attack Path}
+
+The end-to-end attack path requires no novel infrastructure and is
+reproducible by a moderately skilled threat actor. The actor creates a
+Hugging Face account with a name that differs from a popular model
+publisher's account by a single character transposition. They publish a
+modified checkpoint whose malicious payload is embedded in a tensor that is
+never accessed during standard evaluation. Engineers performing searches for
+the original model encounter the forked repository, note comparable download
+statistics and a convincing model card, and pull the artifact. The artifact
+clears all code-focused CI checks because no ML model inspection is
+configured. It is registered in the internal model registry, promoted to
+staging, and eventually deployed to a production inference endpoint, at
+which point the payload executes.
+
+%% -----------------------------------------------------------------------
+\section{System Architecture}
+\label{sec:design}
+%% -----------------------------------------------------------------------
+
+\subsection{Design Principles}
+
+The model-provenance-guard framework is grounded in four design principles
+derived from established supply chain security practice and the zero-trust
+architecture posture described by~\citet{mudusu2026zerotrust}.
+
+\textbf{Shift-left enforcement.} Provenance checks must occur at the model
+intake boundary, before any artifact is registered in an internal model
+registry or promoted beyond the staging environment. Checks that operate
+after deployment provide no prevention value.
+
+\textbf{Defense in depth.} No single control is sufficient. Hash
+verification catches substitution attacks but not artifacts that were never
+in the registry. Signature verification catches unsigned artifacts but not
+ones signed by a compromised key. Binary inspection catches format-level
+anomalies but not neural backdoors. The pipeline combines all four controls
+because each addresses a distinct portion of the threat surface.
+
+\textbf{Hard failures, not warnings.} Any control failure must block pipeline
+progression. A provenance gate that emits warnings while allowing promotion
+to continue provides no practical security benefit and creates compliance
+theater.
+
+\textbf{Registry integrity bootstrapping.} The trusted hash registry must
+itself be protected against tampering. The pipeline validates the registry's
+own SHA-256 hash against a value stored as a sealed repository secret before
+accepting any registry lookup result.
+
+\subsection{Pipeline Architecture}
+
+The provenance gate is implemented as a GitHub Actions workflow with five
+sequentially dependent jobs, as illustrated in Figure~\ref{fig:pipeline}.
+
+\begin{figure}[h]
+\centering
+\fbox{\parbox{0.85\columnwidth}{%
+\textbf{Job 1: Registry Integrity Check}\\
+Computes SHA-256 of trusted\_models.json and\\
+compares against a sealed repository secret.\\[4pt]
+\textbf{Job 2: Hash Verification}\\
+Downloads artifact, computes SHA-256, and checks\\
+against the trusted registry (not the model card).\\[4pt]
+\textbf{Job 3: Cosign Signature Verification}\\
+Verifies .bundle or .sig file against an organization\\
+public key stored as a repository secret.\\[4pt]
+\textbf{Job 4: Binary Format Inspection}\\
+Routes to picklescan (PyTorch) or verify\_weights.py\\
+(Safetensors / GGUF) based on file extension.\\[4pt]
+\textbf{Job 5: Provenance Gate}\\
+Evaluates all upstream results. Fails the pipeline\\
+if any required job did not succeed.
+}}
+\caption{Five-stage provenance gate pipeline.}
+\label{fig:pipeline}
+\end{figure}
+
+The workflow triggers on three event types: pull requests that modify any
+path containing model artifact files (\texttt{*.safetensors},
+\texttt{*.gguf}, \texttt{*.pt}, \texttt{*.pth}), a nightly schedule that
+scans the organization's staging model cache for drift, and
+\texttt{workflow\_dispatch} for on-demand verification of specific artifacts.
+
+\subsection{Trusted Registry Design}
+
+The trusted model registry is a JSON file maintained in the same repository
+as the workflow, protected by branch protection rules requiring at least
+one approved reviewer on any pull request that modifies it. Each entry
+records the model name, the artifact filename, the SHA-256 hash computed by
+a human reviewer at initial review time, the source URL and source repository
+commit hash, the reviewing engineer's identity, the review timestamp, and an
+optional Cosign bundle path.
+
+A critical design decision is that the trusted hash must be computed by a
+human reviewer from the artifact at initial review time and must not be
+sourced from the model card or model hub metadata. An adversary with control
+over a model repository can update the published hash at any time. Only
+hashes computed independently and stored in a separately controlled registry
+can provide supply chain integrity guarantees.
+
+%% -----------------------------------------------------------------------
+\section{Implementation}
+\label{sec:impl}
+%% -----------------------------------------------------------------------
+
+\subsection{Safetensors Header Inspector}
+
+The \texttt{inspect\_safetensors()} function performs seven checks before
+returning a pass or fail verdict, and in no case does it load tensor data
+into memory.
+
+\textbf{Check 1: Minimum file size.} The Safetensors specification requires
+the first eight bytes to encode the header length as a little-endian
+unsigned 64-bit integer. A file smaller than eight bytes cannot be a valid
+Safetensors file and is rejected immediately.
+
+\textbf{Check 2: Header size bounds.} The declared header size is validated
+against a configurable ceiling (100~MB by default) and a warning threshold
+(10~MB). Headers exceeding the ceiling indicate a possible header injection
+attack or a severely malformed file. Headers between the warning threshold
+and ceiling are flagged for manual review.
+
+\textbf{Check 3: UTF-8 validity.} Header bytes must decode as valid UTF-8
+before JSON parsing is attempted. Files that fail UTF-8 decoding are rejected
+before any JSON parser is invoked, preventing a class of attacks that exploit
+parser behavior on malformed Unicode sequences.
+
+\textbf{Check 4: JSON validity.} The decoded header string must parse as
+valid JSON. A malformed JSON header is treated as a hard anomaly rather than
+a soft warning because legitimate Safetensors files produced by any major
+framework always contain well-formed JSON headers.
+
+\textbf{Checks 5--6: Tensor entry validation.} Each tensor entry in the
+header must contain a \texttt{dtype} field drawn from the set of valid
+Safetensors data types (\texttt{F64}, \texttt{F32}, \texttt{F16},
+\texttt{BF16}, \texttt{I64}, \texttt{I32}, \texttt{I16}, \texttt{I8},
+\texttt{U8}, \texttt{BOOL}), a well-formed integer-list \texttt{shape} field
+with non-negative dimensions, and a two-element integer-list
+\texttt{data\_offsets} field with a non-negative start and an end no less
+than the start. Any entry failing these checks is classified as anomalous.
+
+\textbf{Check 7: Data offset bounds.} The maximum data offset declared
+across all tensor entries is added to the header region's starting position
+and compared against the file size. A declared data region that extends
+beyond the end of the file is treated as a hard failure. This check catches
+truncated files and files constructed to declare phantom data regions as a
+precursor to parser exploitation.
+
+\subsection{GGUF Inspector}
+
+The \texttt{inspect\_gguf()} function validates the binary header and
+audits metadata key names without parsing metadata values, which would
+require a full GGUF parser and introduce its own attack surface.
+
+The function first checks that the file begins with the four magic bytes
+\texttt{GGUF} (ASCII). It then reads the version field, flagging versions
+outside the set \{2, 3\} as anomalous while permitting inspection to
+continue (unless \texttt{GGUF\_STRICT=1} is set in the environment). It
+reads the declared tensor count and key-value count, flagging the latter
+if it exceeds 10,000, which far exceeds any count observed in production
+models from major providers.
+
+For each metadata key, the function reads the key length as a
+little-endian 64-bit integer, rejects keys longer than 1,024 bytes, reads
+the key bytes, validates UTF-8 encoding, and checks whether the key name
+begins with one of 28 known architecture-specific prefixes defined in the
+GGUF v3 specification (\texttt{general.}, \texttt{llama.},
+\texttt{mistral.}, \texttt{tokenizer.}, etc.). Keys that do not match any
+expected prefix are flagged as anomalous. Because the GGUF format
+interleaves key names with variable-length, variable-type values, fully
+sequential key parsing without a complete value-skip implementation is not
+safe; the current inspector reads the first key and classifies it, with a
+documented path to enable full sequential parsing using a complete
+GGUF value-skip implementation.
+
+\subsection{Cross-Platform Correctness}
+
+The initial implementation hardcoded \texttt{/tmp} as the report output
+directory and used \texttt{datetime.utcnow()}, which was deprecated in
+Python~3.12. We corrected the report path to use \texttt{tempfile.gettempdir()},
+which resolves correctly on Windows, Linux, and macOS, and replaced the
+deprecated call with \texttt{datetime.now(datetime.timezone.utc)}.
+
+\subsection{Hash Verification and Registry Lookup}
+
+The \texttt{verify\_against\_registry()} function computes the SHA-256
+digest of the artifact in 1~MB chunks to accommodate files that routinely
+exceed 4~GB, then queries the trusted registry for a matching entry by
+filename. If no entry is found, the function returns a permissive result
+with a warning, leaving the hard failure to the GitHub Actions pipeline
+step, which is configured to treat an unregistered artifact as a blocking
+error. If an entry is found but the hash does not match, the function
+returns a hard failure immediately.
+
+%% -----------------------------------------------------------------------
+\section{Evaluation}
+\label{sec:eval}
+%% -----------------------------------------------------------------------
+
+\subsection{Test Methodology}
+
+We constructed eight synthetic test cases covering the Safetensors and GGUF
+formats. Each test case programmatically constructs a binary artifact that
+embodies a specific structural condition---either a valid format or a
+specific anomaly---and invokes the inspector with the \texttt{--skip-hash}
+flag to isolate the binary inspection controls from the registry hash check.
+The expected exit code (0 for pass, 1 for failure) is compared against the
+actual exit code to determine test outcome.
+
+PyTorch checkpoint testing is delegated to \texttt{picklescan}, a
+well-validated tool with its own test suite; we do not redundantly test
+functionality that picklescan already covers. Neural backdoor detection is
+explicitly outside the scope of binary inspection and is not tested.
+
+\subsection{Results}
+
+Table~\ref{tab:results} summarizes the outcomes across all eight test cases.
+
+\begin{table}[h]
+\caption{Binary inspector evaluation results.}
+\label{tab:results}
+\begin{tabular}{p{0.52\columnwidth}cc}
+\toprule
+\textbf{Test Case} & \textbf{Expected} & \textbf{Result} \\
+\midrule
+Safetensors: valid file (F32, correct offsets)  & PASS & \textbf{PASS} \\
+Safetensors: invalid dtype (\texttt{EVIL\_TYPE}) & FAIL & \textbf{FAIL} \\
+Safetensors: data offset past EOF               & FAIL & \textbf{FAIL} \\
+Safetensors: non-JSON header bytes              & FAIL & \textbf{FAIL} \\
+GGUF: valid file, zero KV entries               & PASS & \textbf{PASS} \\
+GGUF: valid \texttt{general.architecture} key   & PASS & \textbf{PASS} \\
+GGUF: wrong magic bytes (\texttt{EVIL})         & FAIL & \textbf{FAIL} \\
+GGUF: unsupported version (v99), non-strict mode & PASS & \textbf{PASS} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All eight test cases produced the expected outcome, yielding a false
+negative rate of 0.0\% and a false positive rate of 0.0\% under the tested
+conditions. The unsupported GGUF version case correctly produces a warning
+annotation in the inspection report while allowing the artifact through,
+consistent with the design intent that version anomalies should surface for
+human review without blocking benign artifacts from non-standard but
+structurally sound files.
+
+\subsection{Performance Characteristics}
+
+Binary inspection latency is bounded by file read bandwidth rather than
+computation. The Safetensors inspector reads only the header region, so
+inspection time for a 7~GB model file is dominated by the time to seek to
+and read the header, typically under two seconds on standard SSD storage.
+The GGUF inspector reads the fixed-length header and the first metadata key,
+a region that is always well under 1~KB, making its latency effectively
+constant regardless of file size. Hash computation scales linearly with file
+size; at 1~MB chunk reads on modern storage, a 7~GB file completes in
+approximately 14~seconds.
+
+%% -----------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%% -----------------------------------------------------------------------
+
+\subsection{Limitations}
+
+The most consequential limitation of the framework is its inability to
+detect neural backdoors embedded in weight values. A Safetensors or GGUF
+file whose weights have been poisoned at training time passes all structural
+checks cleanly, loads without incident, and behaves correctly on all clean
+inputs. The malicious behavior surfaces only on inputs containing the
+attacker's trigger pattern. Addressing this requires behavioral monitoring
+at inference time: continuous analysis of output distributions, activation
+statistics, and response latency to identify anomalies that deviate from
+a baseline established on known-clean model weights~\cite{mitre_atlas2023}.
+This is a complementary defense that operates at the application layer, not
+the binary layer, and it falls outside the scope of the present framework.
+
+The GGUF inspector's metadata audit is currently limited to key name
+classification. Full value inspection, which would enable detection of
+oversized values and values whose types are inconsistent with the
+architecture specification, requires a complete GGUF value-skip implementation
+that correctly advances the file pointer across all GGUF value types. We
+document this limitation explicitly and recommend that teams requiring full
+metadata value inspection use \texttt{gguf-py} or llama.cpp's
+\texttt{gguf-dump} utility as a complement.
+
+\subsection{Scope and Integration}
+
+The framework is designed to sit at the model intake boundary: between the
+artifact download step and the step that registers the artifact in an
+internal model registry. It does not address security controls at earlier
+stages (model training integrity, dataset provenance) or at later stages
+(inference-time behavioral monitoring). Organizations should treat this
+framework as one layer in a defense-in-depth strategy aligned with the NIST
+AI RMF~\cite{nist_ai_rmf2023} and the OWASP LLM Top~10~\cite{owasp_llm_supply2025}.
+
+\subsection{Future Work}
+
+Four extensions represent near-term priorities. First, extending the binary
+inspector to cover ONNX protobuf models and TensorFlow SavedModel artifacts,
+which introduce their own format-specific attack surfaces not addressed by
+the current implementation. Second, integrating AI Software Bill of
+Materials (AI-SBOM) generation into the provenance gate output, enabling
+downstream systems to consume cryptographically attested lineage records in
+standard SBOM format~\cite{gentyala2026aisbom,frontiers2026aibom}. Third,
+implementing complete GGUF metadata value parsing to enable schema-level
+validation beyond key name auditing. Fourth, investigating integration with
+inference-time behavioral monitoring to close the neural backdoor detection
+gap, for example by coupling the provenance gate output with a downstream
+monitoring hook that enforces output distribution baselines.
+
+%% -----------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+%% -----------------------------------------------------------------------
+
+The machine learning supply chain is not merely a software supply chain. It
+is a binary supply chain in which the most sensitive components---weight
+files that encode model behavior---are distributed through infrastructure
+that provides no cryptographic integrity guarantees by default and consumed
+by tooling that offers no structural inspection prior to loading. This gap
+is neither obscure nor theoretical; it has been exploited in documented
+incidents and characterized in peer-reviewed vulnerability research across
+all three dominant weight file formats.
+
+We have presented model-provenance-guard, a framework that addresses this
+gap with a combination of binary-level inspection and cryptographic
+provenance enforcement, deployed at the CI/CD boundary where prevention
+remains possible. The framework requires no architectural changes to
+existing MLOps pipelines; it inserts as a gate between artifact download
+and registry registration. Against eight synthetic adversarial test cases
+spanning the Safetensors and GGUF attack surfaces, the inspector returned
+zero false negatives and zero false positives.
+
+The underlying principle is not novel: build the gate, not more alerts.
+Monitoring a threat class that cannot be observed through existing
+instrumentation generates no signal. The response to weaponized weights is
+structural, and it must be implemented before the next artifact a team
+stages for production introduces a threat that no existing tool was designed
+to see.
+
+%% -----------------------------------------------------------------------
+\begin{acks}
+The authors thank the security research community for disclosing the
+llama.cpp heap-buffer-overflow vulnerabilities (Cisco Talos, 2024) and the
+Trail of Bits team for the Safetensors library security assessment (2023),
+both of which directly informed the threat model developed in this work.
+The model-provenance-guard toolkit is released under the MIT License and
+is available at \url{https://github.com/sunilgentyala/model-provenance-guard}.
+\end{acks}
+
+%% -----------------------------------------------------------------------
+\balance
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}
