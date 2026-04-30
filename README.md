@@ -145,3 +145,4 @@ IEEE Senior Member | Cloud Security Alliance Representative | ISACA Professional
 Creator: ContextGuard (zero-trust MCP middleware) | GSH Framework (agentic AI threat hunting)
 
 [linkedin.com/in/sunil-gentyala](https://linkedin.com/in/sunil-gentyala) | [github.com/sunilgentyala](https://github.com/sunilgentyala)
+email: sunil.gentyala@ieee.org
