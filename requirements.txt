@@ -1,0 +1,6 @@
+# Binary inspection
+picklescan>=0.0.9
+safetensors>=0.4.0
+
+# HTTP (used by CI workflow steps, optional for local use)
+requests>=2.31.0

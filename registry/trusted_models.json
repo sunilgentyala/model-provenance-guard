@@ -1,0 +1,32 @@
+{
+  "_comment": "Trusted model registry for model-provenance-guard. Each entry represents a model artifact that has been reviewed and approved by an authorized engineer. Do not auto-populate entries from external sources. SHA-256 hashes must be computed locally by the reviewing engineer at time of initial review.",
+  "_schema_version": "1.0",
+  "models": [
+    {
+      "name": "mistral-7b-instruct-v0.3",
+      "filename": "model.safetensors",
+      "sha256": "REPLACE_WITH_SHA256_COMPUTED_BY_REVIEWER",
+      "source_url": "https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3",
+      "source_commit": "REPLACE_WITH_HUGGINGFACE_COMMIT_HASH",
+      "format": "safetensors",
+      "reviewed_by": "engineer@yourorg.com",
+      "reviewed_at": "2025-04-01T00:00:00Z",
+      "cosign_bundle": "model.safetensors.bundle",
+      "approved_for": ["staging"],
+      "notes": "Template entry. Replace all placeholder values before use."
+    },
+    {
+      "name": "llama-3-8b-instruct-q4-k-m",
+      "filename": "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
+      "sha256": "REPLACE_WITH_SHA256_COMPUTED_BY_REVIEWER",
+      "source_url": "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF",
+      "source_commit": "REPLACE_WITH_HUGGINGFACE_COMMIT_HASH",
+      "format": "gguf",
+      "reviewed_by": "engineer@yourorg.com",
+      "reviewed_at": "2025-04-01T00:00:00Z",
+      "cosign_bundle": null,
+      "approved_for": ["staging"],
+      "notes": "Template entry. Replace all placeholder values before use."
+    }
+  ]
+}

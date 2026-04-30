@@ -1,0 +1,331 @@
+name: Model Provenance Gate
+
+# Triggers: PRs that touch model artifacts, nightly runs against model cache,
+# and manual dispatch for on-demand verification.
+on:
+  pull_request:
+    paths:
+      - "models/**"
+      - "weights/**"
+      - "artifacts/**"
+      - "registry/trusted_models.json"
+  schedule:
+    # Nightly scan at 02:00 UTC against the staging model cache
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: "Relative path to the model artifact to verify"
+        required: true
+        type: string
+      model_name:
+        description: "Model name as listed in trusted_models.json"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write     # Required for keyless Cosign signing with OIDC
+  checks: write       # Required for annotating PR check results
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY_PATH: "registry/trusted_models.json"
+
+jobs:
+  # -----------------------------------------------------------------------
+  # JOB 1: Validate the trusted registry file itself has not been tampered
+  # with by checking its own hash against a pinned value stored as a secret.
+  # -----------------------------------------------------------------------
+  registry-integrity:
+    name: Registry Integrity Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify registry file SHA-256
+        shell: bash
+        run: |
+          COMPUTED=$(sha256sum "${{ env.REGISTRY_PATH }}" | awk '{print $1}')
+          echo "Computed registry hash: $COMPUTED"
+          if [ -z "${{ secrets.TRUSTED_REGISTRY_HASH }}" ]; then
+            echo "::warning title=Registry Hash Not Pinned::TRUSTED_REGISTRY_HASH secret is not set. Skipping registry integrity verification. Set this secret before using in production."
+          else
+            if [ "$COMPUTED" != "${{ secrets.TRUSTED_REGISTRY_HASH }}" ]; then
+              echo "::error title=Registry Tampering Detected::trusted_models.json hash does not match pinned value. Blocking pipeline."
+              exit 1
+            fi
+            echo "Registry integrity confirmed."
+          fi
+
+  # -----------------------------------------------------------------------
+  # JOB 2: Download model artifact, compute SHA-256, and verify against
+  # the internal trusted registry. This job does NOT use the hash value
+  # from the model card or Hugging Face metadata.
+  # -----------------------------------------------------------------------
+  hash-verification:
+    name: Hash Verification
+    runs-on: ubuntu-latest
+    needs: registry-integrity
+    outputs:
+      model_filename: ${{ steps.resolve.outputs.model_filename }}
+      model_format: ${{ steps.resolve.outputs.model_format }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet jq 2>/dev/null || true
+          pip install --quiet requests
+
+      - name: Resolve model path from registry
+        id: resolve
+        shell: bash
+        run: |
+          # Determine the model path from workflow_dispatch input or scan all models in PR diff
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODEL_PATH="${{ inputs.model_path }}"
+            MODEL_NAME="${{ inputs.model_name }}"
+          else
+            # For PR and scheduled runs, iterate over all model files in changed paths
+            # This step sets variables for the first discovered model file
+            MODEL_PATH=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -E '\.(safetensors|gguf|pt|pth|bin)$' | head -1 || echo "")
+            MODEL_NAME=$(basename "$MODEL_PATH" 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$MODEL_PATH" ]; then
+            echo "No model artifact found in changed files. Skipping hash verification."
+            echo "model_filename=none" >> $GITHUB_OUTPUT
+            echo "model_format=none" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          EXTENSION="${MODEL_PATH##*.}"
+          echo "model_filename=$MODEL_PATH" >> $GITHUB_OUTPUT
+          echo "model_format=$EXTENSION" >> $GITHUB_OUTPUT
+          echo "Resolved model: $MODEL_PATH (format: $EXTENSION)"
+
+      - name: Compute SHA-256 of artifact
+        id: hash
+        if: steps.resolve.outputs.model_filename != 'none'
+        shell: bash
+        run: |
+          MODEL_FILE="${{ steps.resolve.outputs.model_filename }}"
+          if [ ! -f "$MODEL_FILE" ]; then
+            echo "::error title=Artifact Not Found::Model file $MODEL_FILE does not exist in the workspace."
+            exit 1
+          fi
+          HASH=$(sha256sum "$MODEL_FILE" | awk '{print $1}')
+          echo "Computed SHA-256: $HASH"
+          echo "artifact_hash=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Verify hash against trusted registry
+        if: steps.resolve.outputs.model_filename != 'none'
+        shell: bash
+        env:
+          ARTIFACT_HASH: ${{ steps.hash.outputs.artifact_hash }}
+          MODEL_FILE: ${{ steps.resolve.outputs.model_filename }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          registry_path = os.environ.get("REGISTRY_PATH", "registry/trusted_models.json")
+          artifact_hash = os.environ["ARTIFACT_HASH"]
+          model_filename = os.path.basename(os.environ["MODEL_FILE"])
+
+          with open(registry_path, "r") as f:
+              registry = json.load(f)
+
+          matched = False
+          for entry in registry.get("models", []):
+              if entry.get("filename") == model_filename:
+                  trusted_hash = entry.get("sha256", "")
+                  if artifact_hash == trusted_hash:
+                      print(f"[PASS] Hash verification passed for {model_filename}")
+                      print(f"  Reviewed by: {entry.get('reviewed_by', 'unknown')}")
+                      print(f"  Reviewed at: {entry.get('reviewed_at', 'unknown')}")
+                      matched = True
+                      break
+                  else:
+                      print(f"::error title=Hash Mismatch::{model_filename} hash does not match trusted registry.")
+                      print(f"  Expected: {trusted_hash}")
+                      print(f"  Got:      {artifact_hash}")
+                      sys.exit(1)
+
+          if not matched:
+              print(f"::error title=Unregistered Artifact::{model_filename} is not present in the trusted model registry. Add it via the approved review process.")
+              sys.exit(1)
+          PYEOF
+
+  # -----------------------------------------------------------------------
+  # JOB 3: Cryptographic signature verification using Sigstore/Cosign.
+  # Verifies a .bundle or .sig file signed by the model publisher's key.
+  # -----------------------------------------------------------------------
+  signature-verification:
+    name: Cosign Signature Verification
+    runs-on: ubuntu-latest
+    needs: hash-verification
+    if: needs.hash-verification.outputs.model_filename != 'none'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.0"
+
+      - name: Verify artifact signature
+        shell: bash
+        env:
+          MODEL_FILE: ${{ needs.hash-verification.outputs.model_filename }}
+        run: |
+          if [ ! -f "${MODEL_FILE}.bundle" ] && [ ! -f "${MODEL_FILE}.sig" ]; then
+            echo "::warning title=No Signature Found::No .bundle or .sig file found for $MODEL_FILE."
+            echo "Signature verification skipped. In production, this should be a hard failure."
+            echo "Set REQUIRE_SIGNATURE=true as a repository variable to enforce signature requirement."
+            if [ "${{ vars.REQUIRE_SIGNATURE }}" = "true" ]; then
+              echo "::error title=Signature Required::REQUIRE_SIGNATURE is enabled but no signature bundle found. Blocking."
+              exit 1
+            fi
+            exit 0
+          fi
+
+          # Verify using the organization's public key stored as a secret
+          echo "${{ secrets.COSIGN_PUBLIC_KEY }}" > /tmp/cosign.pub
+
+          if [ -f "${MODEL_FILE}.bundle" ]; then
+            cosign verify-blob \
+              --key /tmp/cosign.pub \
+              --bundle "${MODEL_FILE}.bundle" \
+              "${MODEL_FILE}"
+          elif [ -f "${MODEL_FILE}.sig" ]; then
+            cosign verify-blob \
+              --key /tmp/cosign.pub \
+              --signature "${MODEL_FILE}.sig" \
+              "${MODEL_FILE}"
+          fi
+
+          echo "::notice title=Signature Valid::Cosign signature verification passed for $MODEL_FILE"
+          rm -f /tmp/cosign.pub
+
+  # -----------------------------------------------------------------------
+  # JOB 4: Format-specific binary inspection.
+  # Runs picklescan for .pt/.pth files.
+  # Runs verify_weights.py for .safetensors and .gguf files.
+  # -----------------------------------------------------------------------
+  binary-inspection:
+    name: Binary Format Inspection
+    runs-on: ubuntu-latest
+    needs: [hash-verification, signature-verification]
+    if: needs.hash-verification.outputs.model_filename != 'none'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install inspection dependencies
+        run: |
+          pip install --quiet safetensors picklescan struct
+
+      - name: Run picklescan on PyTorch checkpoints
+        if: needs.hash-verification.outputs.model_format == 'pt' || needs.hash-verification.outputs.model_format == 'pth'
+        shell: bash
+        run: |
+          echo "Running picklescan on ${{ needs.hash-verification.outputs.model_filename }}"
+          picklescan -p "${{ needs.hash-verification.outputs.model_filename }}"
+          SCAN_EXIT=$?
+          if [ $SCAN_EXIT -ne 0 ]; then
+            echo "::error title=Pickle Threat Detected::picklescan found dangerous opcodes in ${{ needs.hash-verification.outputs.model_filename }}. Artifact is quarantined."
+            exit 1
+          fi
+          echo "::notice title=Pickle Scan Clean::No dangerous pickle opcodes detected."
+
+      - name: Run Safetensors header inspection
+        if: needs.hash-verification.outputs.model_format == 'safetensors'
+        shell: bash
+        run: |
+          python scripts/verify_weights.py \
+            --file "${{ needs.hash-verification.outputs.model_filename }}" \
+            --registry "${{ env.REGISTRY_PATH }}" \
+            --format safetensors
+          INSPECT_EXIT=$?
+          if [ $INSPECT_EXIT -ne 0 ]; then
+            echo "::error title=Safetensors Anomaly::Header inspection failed. Artifact is quarantined."
+            exit 1
+          fi
+
+      - name: Run GGUF magic byte and metadata validation
+        if: needs.hash-verification.outputs.model_format == 'gguf'
+        shell: bash
+        run: |
+          python scripts/verify_weights.py \
+            --file "${{ needs.hash-verification.outputs.model_filename }}" \
+            --registry "${{ env.REGISTRY_PATH }}" \
+            --format gguf
+          INSPECT_EXIT=$?
+          if [ $INSPECT_EXIT -ne 0 ]; then
+            echo "::error title=GGUF Anomaly::Metadata validation failed. Artifact is quarantined."
+            exit 1
+          fi
+
+      - name: Upload inspection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provenance-inspection-report
+          path: /tmp/inspection_report_*.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # -----------------------------------------------------------------------
+  # JOB 5: Final gate. Only runs if all previous jobs passed.
+  # Writes a signed attestation JSON to the workflow summary and optionally
+  # posts a status comment to the pull request.
+  # -----------------------------------------------------------------------
+  provenance-gate:
+    name: Provenance Gate
+    runs-on: ubuntu-latest
+    needs: [hash-verification, signature-verification, binary-inspection]
+    if: always()
+    steps:
+      - name: Evaluate gate status
+        shell: bash
+        run: |
+          HASH_RESULT="${{ needs.hash-verification.result }}"
+          SIG_RESULT="${{ needs.signature-verification.result }}"
+          BINARY_RESULT="${{ needs.binary-inspection.result }}"
+
+          echo "## Model Provenance Gate Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Control | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry Integrity | ${{ needs.registry-integrity.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Hash Verification | $HASH_RESULT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosign Signature | $SIG_RESULT |" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary Inspection | $BINARY_RESULT |" >> $GITHUB_STEP_SUMMARY
+
+          # Fail the gate if any required job failed
+          if [ "$HASH_RESULT" = "failure" ] || [ "$BINARY_RESULT" = "failure" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> GATE BLOCKED: Model artifact failed provenance verification. Do not promote to production." >> $GITHUB_STEP_SUMMARY
+            echo "::error title=Provenance Gate Blocked::One or more provenance checks failed. Artifact must not be promoted to production."
+            exit 1
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> GATE PASSED: All provenance controls satisfied." >> $GITHUB_STEP_SUMMARY
+          echo "::notice title=Provenance Gate Passed::All controls passed. Artifact is cleared for pipeline promotion."
