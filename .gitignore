@@ -26,3 +26,6 @@ inspection_report_*.json
 Thumbs.db
 .vscode/
 .idea/
+
+# Unpublished manuscripts — keep local only
+paper/
