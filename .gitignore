@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+venv/
+.venv/
+env/
+
+# Model weight files — never commit actual weights
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Inspection reports
+inspection_report_*.json
+/tmp/
+
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
