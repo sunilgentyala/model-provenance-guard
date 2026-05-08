@@ -89,7 +89,7 @@ Set the following repository secrets:
 | Secret | Purpose |
 |---|---|
 | `COSIGN_PUBLIC_KEY` | PEM-encoded public key for verifying model signatures |
-| `MODEL_REGISTRY_PATH` | Path to your trusted_models.json in the runner environment |
+| `TRUSTED_REGISTRY_HASH` | SHA-256 of `trusted_models.json` used by the registry integrity job to detect tampering |
 
 ### Step 3: Run the Header Inspector Locally
 

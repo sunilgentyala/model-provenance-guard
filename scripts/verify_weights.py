@@ -29,7 +29,7 @@ import sys
 import datetime
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -114,7 +114,7 @@ def compute_sha256(filepath: str, chunk_size: int = 1024 * 1024) -> str:
 # Utility: Trusted registry lookup
 # ---------------------------------------------------------------------------
 
-def lookup_registry(registry_path: str, filename: str) -> dict | None:
+def lookup_registry(registry_path: str, filename: str) -> Optional[dict]:
     """
     Return the registry entry for the given filename, or None if not found.
     Exits with an error if the registry file cannot be parsed.
@@ -342,13 +342,72 @@ def inspect_safetensors(filepath: str, registry_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# GGUF value-skip helpers
+# ---------------------------------------------------------------------------
+
+# GGUF value type identifiers per the GGUF v3 specification.
+_GGUF_TYPE_UINT8   = 0
+_GGUF_TYPE_INT8    = 1
+_GGUF_TYPE_UINT16  = 2
+_GGUF_TYPE_INT16   = 3
+_GGUF_TYPE_UINT32  = 4
+_GGUF_TYPE_INT32   = 5
+_GGUF_TYPE_FLOAT32 = 6
+_GGUF_TYPE_BOOL    = 7
+_GGUF_TYPE_STRING  = 8
+_GGUF_TYPE_ARRAY   = 9
+_GGUF_TYPE_UINT64  = 10
+_GGUF_TYPE_INT64   = 11
+_GGUF_TYPE_FLOAT64 = 12
+
+# Fixed byte widths for scalar types. STRING and ARRAY are handled separately.
+_GGUF_SCALAR_SIZES = {
+    _GGUF_TYPE_UINT8:   1,
+    _GGUF_TYPE_INT8:    1,
+    _GGUF_TYPE_UINT16:  2,
+    _GGUF_TYPE_INT16:   2,
+    _GGUF_TYPE_UINT32:  4,
+    _GGUF_TYPE_INT32:   4,
+    _GGUF_TYPE_FLOAT32: 4,
+    _GGUF_TYPE_BOOL:    1,
+    _GGUF_TYPE_UINT64:  8,
+    _GGUF_TYPE_INT64:   8,
+    _GGUF_TYPE_FLOAT64: 8,
+}
+
+
+def _gguf_skip_string(f: Any) -> None:
+    """Read and discard a GGUF length-prefixed string from the file handle."""
+    length = struct.unpack("<Q", f.read(8))[0]
+    f.read(length)
+
+
+def _gguf_skip_value(f: Any, value_type: int) -> None:
+    """
+    Advance the file cursor past a single GGUF metadata value of the given type.
+    Raises struct.error or ValueError on malformed data.
+    """
+    if value_type in _GGUF_SCALAR_SIZES:
+        f.read(_GGUF_SCALAR_SIZES[value_type])
+    elif value_type == _GGUF_TYPE_STRING:
+        _gguf_skip_string(f)
+    elif value_type == _GGUF_TYPE_ARRAY:
+        elem_type = struct.unpack("<I", f.read(4))[0]
+        elem_count = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(elem_count):
+            _gguf_skip_value(f, elem_type)
+    else:
+        raise ValueError(f"Unknown GGUF value type: {value_type}")
+
+
+# ---------------------------------------------------------------------------
 # GGUF inspection
 # ---------------------------------------------------------------------------
 
 def inspect_gguf(filepath: str, registry_path: str) -> bool:
     """
-    Validate the GGUF file magic bytes and audit the metadata key-value section
-    for entries that do not conform to known architectural key prefixes.
+    Validate the GGUF file magic bytes and audit every metadata key-value pair
+    for keys that do not conform to known architectural key prefixes.
 
     GGUF binary layout (v2/v3):
       Bytes 0-3:   Magic ("GGUF")
@@ -357,9 +416,8 @@ def inspect_gguf(filepath: str, registry_path: str) -> bool:
       Bytes 16-23: Metadata key-value count (uint64 LE)
       Bytes 24+:   Metadata key-value pairs (variable length)
 
-    This inspector reads the magic, version, and key names only. It does not
-    load or interpret tensor data. Reading key names requires parsing
-    length-prefixed strings; any parse failure is treated as a hard anomaly.
+    Key-value pairs are fully iterated using a type-aware value-skip so that
+    all keys are audited, not just the first. Tensor data is never loaded.
 
     Returns True if all checks pass, False otherwise.
     """
@@ -392,13 +450,12 @@ def inspect_gguf(filepath: str, registry_path: str) -> bool:
         report["checks"]["magic_bytes"] = "pass"
 
         # Check version
-        version_bytes = f.read(4)
-        version = struct.unpack("<I", version_bytes)[0]
+        version = struct.unpack("<I", f.read(4))[0]
         log_info(f"  GGUF version: {version}")
         if version not in GGUF_SUPPORTED_VERSIONS:
             log_warn(f"GGUF version {version} is not in the known-safe set {GGUF_SUPPORTED_VERSIONS}. This may indicate a non-standard or modified file.")
             report["anomalies"].append(f"Unsupported GGUF version: {version}")
-        report["checks"]["version"] = "pass" if version in GGUF_SUPPORTED_VERSIONS else "warn"
+        report["checks"]["version_check"] = "pass" if version in GGUF_SUPPORTED_VERSIONS else "warn"
 
         # Read tensor count and metadata count
         tensor_count = struct.unpack("<Q", f.read(8))[0]
@@ -410,24 +467,23 @@ def inspect_gguf(filepath: str, registry_path: str) -> bool:
             log_warn(f"Unusually high metadata key-value count: {kv_count}. Flagging for review.")
             report["anomalies"].append(f"High KV count: {kv_count}")
 
-        # Read metadata key names. GGUF keys are stored as:
-        #   key_len: uint64 LE
-        #   key_data: UTF-8 bytes of length key_len
-        # followed by the value type and value. We read key names only and
-        # skip value parsing to keep this inspector memory-safe.
-        anomalous_keys = []
-        known_keys = []
+        # Iterate all metadata key-value pairs. Each entry:
+        #   key:   uint64 length + UTF-8 bytes
+        #   type:  uint32 (GGUF value type enum)
+        #   value: type-specific encoding (skipped via _gguf_skip_value)
+        anomalous_keys: list = []
+        known_keys: list = []
         parse_error = False
 
-        for i in range(min(kv_count, 2000)):  # cap at 2000 to prevent runaway reads
+        for i in range(min(kv_count, 2000)):  # cap at 2000 to prevent runaway reads on corrupt files
             try:
-                key_len_bytes = f.read(8)
-                if len(key_len_bytes) < 8:
+                key_len_raw = f.read(8)
+                if len(key_len_raw) < 8:
                     log_error(f"Unexpected end of file reading metadata key length at index {i}.")
                     parse_error = True
                     break
 
-                key_len = struct.unpack("<Q", key_len_bytes)[0]
+                key_len = struct.unpack("<Q", key_len_raw)[0]
 
                 if key_len > 1024:
                     log_error(f"Metadata key at index {i} declares length {key_len}, which exceeds 1024 bytes. This is anomalous.")
@@ -449,30 +505,30 @@ def inspect_gguf(filepath: str, registry_path: str) -> bool:
                     parse_error = True
                     break
 
-                # Classify key
+                # Classify key against known architecture prefixes
                 if any(key_name.startswith(prefix) for prefix in GGUF_EXPECTED_KEY_PREFIXES):
                     known_keys.append(key_name)
                 else:
                     log_warn(f"Unexpected metadata key: '{key_name}' does not match any known architecture prefix.")
                     anomalous_keys.append(key_name)
 
-                # Skip past the value: we stop parsing value data because GGUF value
-                # types have variable structure. A full GGUF parser is required for
-                # complete metadata inspection. This inspector only audits key names.
-                # Break after reading keys to avoid parsing value bytes incorrectly.
-                # Teams requiring full value inspection should use llama.cpp's
-                # gguf-dump utility or the gguf-py library.
-                break  # Remove this break to attempt sequential key parsing with a full value-skip implementation
+                # Read value type and skip value bytes so the cursor advances
+                # to the next key-value pair correctly.
+                value_type_raw = f.read(4)
+                if len(value_type_raw) < 4:
+                    log_error(f"Unexpected end of file reading value type at index {i}.")
+                    parse_error = True
+                    break
+                value_type = struct.unpack("<I", value_type_raw)[0]
+                _gguf_skip_value(f, value_type)
 
-            except struct.error as exc:
-                log_error(f"Struct unpack error at metadata index {i}: {exc}")
+            except (struct.error, ValueError) as exc:
+                log_error(f"Parse error at metadata index {i}: {exc}")
                 parse_error = True
                 break
 
-        report["checks"]["magic_bytes"] = "pass"
-        report["checks"]["version_check"] = "pass" if version in GGUF_SUPPORTED_VERSIONS else "warn"
         report["checks"]["metadata_key_audit"] = "fail" if (anomalous_keys or parse_error) else "pass"
-        report["known_keys_sampled"] = known_keys
+        report["known_keys_found"] = known_keys
         report["anomalous_keys"] = anomalous_keys
 
         if parse_error:
@@ -484,13 +540,12 @@ def inspect_gguf(filepath: str, registry_path: str) -> bool:
             log_warn(f"{len(anomalous_keys)} unexpected metadata key(s) found: {anomalous_keys}")
             log_warn("Manual review required before this artifact is admitted to production.")
             report["anomalies"].append(f"Unexpected keys: {anomalous_keys}")
-            # Unexpected keys are a warning, not a hard failure, unless STRICT mode is set.
-            # Set the environment variable GGUF_STRICT=1 to treat unexpected keys as failures.
+            # Set GGUF_STRICT=1 to treat unexpected keys as hard failures.
             if os.environ.get("GGUF_STRICT", "0") == "1":
                 write_report(report)
                 return False
 
-    log_pass(f"GGUF inspection completed. {len(known_keys)} known key(s) sampled.")
+    log_pass(f"GGUF inspection completed. {len(known_keys)} known key(s) found, {len(anomalous_keys)} anomalous.")
     report["passed"] = True
     write_report(report)
     return True
